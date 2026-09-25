@@ -18,12 +18,21 @@ jobs:
       - run: cargo test -j4 --workspace
       - run: cargo clippy -j4 --workspace --all-targets -- -D warnings
       - run: pnpm tauri build
+      - run: |
+          cargo build --release -j4 -p homeproxy-cli
+          ditto -c -k --sequesterRsrc --keepParent target/release/bundle/macos/HomeProxy.app homeproxy-macos.zip
+          tar -czf homeproxy-cli-macos.tar.gz -C target/release homeproxy
       - uses: actions/upload-artifact@v4
         with:
           name: homeproxy-macos
-          path: target/release/bundle/macos/*.app
+          path: |
+            homeproxy-macos.zip
+            homeproxy-cli-macos.tar.gz
   gateway:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: docker build -t homeproxy-gateway gateway
+      - uses: dtolnay/rust-toolchain@stable
+      - run: docker build -t homeproxy-gateway:dev gateway
+      - run: cargo test -j4 -p homeproxy-core -p homeproxy-cli
+      - run: python3 tests/gateway.py
