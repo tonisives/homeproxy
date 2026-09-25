@@ -1,0 +1,9 @@
+/dist
+/node_modules
+/target
+
+
+.worktrees/
+crates/*/gen/
+.env*
+.homeproxy-test-*/

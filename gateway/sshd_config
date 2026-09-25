@@ -1,0 +1,17 @@
+Port 2222
+HostKey /config/ssh_host_ed25519_key
+AuthorizedKeysFile /etc/ssh/homeproxy_authorized_keys
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+AllowUsers proxy
+AllowTcpForwarding yes
+AllowStreamLocalForwarding no
+PermitOpen 127.0.0.1:18080
+PermitListen 127.0.0.1:18080
+GatewayPorts no
+X11Forwarding no
+AllowAgentForwarding no
+PermitTTY no
+ForceCommand /bin/false
+PidFile /tmp/sshd.pid

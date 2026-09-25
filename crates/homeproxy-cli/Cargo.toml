@@ -1,0 +1,15 @@
+[package]
+name = "homeproxy-cli"
+version = "0.1.0"
+edition = "2021"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "homeproxy"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+homeproxy-core = { path = "../homeproxy-core" }

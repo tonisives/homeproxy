@@ -1,0 +1,19 @@
+[package]
+name = "homeproxy-tauri"
+version = "0.1.0"
+description = "HomeProxy desktop controller"
+edition = "2021"
+
+[lints]
+workspace = true
+
+[lib]
+name = "homeproxy_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.5", features = [] }
+
+[dependencies]
+homeproxy-core = { path = "../homeproxy-core" }
+tauri = { version = "2.10", features = [] }
