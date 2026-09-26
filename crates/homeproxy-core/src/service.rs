@@ -51,10 +51,7 @@ pub struct Upstream {
 pub fn directory() -> Result<PathBuf> {
     env::var_os("HOMEPROXY_CONFIG_DIR")
         .map(PathBuf::from)
-        .or_else(|| {
-            env::var_os("HOME")
-                .map(|p| PathBuf::from(p).join("Library/Application Support/HomeProxy"))
-        })
+        .or_else(|| env::var_os("HOME").map(|p| PathBuf::from(p).join(".config/homeproxy")))
         .ok_or(ServiceError::Invalid("HOME is unavailable"))
 }
 pub fn load() -> Result<Config> {

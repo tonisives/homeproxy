@@ -9,9 +9,9 @@ private SOCKS port; websites see the home connection's public address.
 
 Build the CLI with `cargo build --release -j4 -p homeproxy-cli`. Copy the resulting
 `homeproxy` executable into your PATH. The installed service copies this executable
-to `~/Library/Application Support/HomeProxy/homeproxy`; no private scripts are needed.
+to `~/.config/homeproxy/homeproxy`; no private scripts are needed.
 
-Create `~/Library/Application Support/HomeProxy/config.json` with mode 600:
+Create `~/.config/homeproxy/config.json` with mode 600:
 
 ```json
 {
@@ -59,14 +59,6 @@ causes connection failure. No component falls back to direct egress.
 The connector's local verification port is bound to loopback. `verify` requests
 `https://example.com/` through that port, the SSH gateway, and the home/upstream
 route without printing the response.
-
-## Existing TGS installations
-
-This is a separate service. Do not enable it alongside the old supervisor using
-the same gateway port. Copy the old known-host entry and identity reference into
-the new configuration, stop the old service, install HomeProxy, then verify.
-On failure, stop HomeProxy and restart the old service. Keep upstream credentials
-in the protected configuration; do not copy them into shell commands or logs.
 
 ## Development
 
