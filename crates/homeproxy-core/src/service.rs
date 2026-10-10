@@ -167,16 +167,13 @@ impl Drop for SleepAssertion {
 
 #[derive(Default)]
 struct RouteHealth {
-    failures: u8,
+    recent_failures: u8,
 }
 impl RouteHealth {
     fn observe(&mut self, healthy: bool) -> bool {
-        self.failures = if healthy {
-            0
-        } else {
-            self.failures.saturating_add(1)
-        };
-        self.failures >= 3
+        // A brief successful reply should not hide a repeatedly stalled route.
+        self.recent_failures = ((self.recent_failures << 1) | u8::from(!healthy)) & 0b11111;
+        self.recent_failures.count_ones() >= 3
     }
 }
 
@@ -240,10 +237,13 @@ pub fn run() -> Result<()> {
         }
         if Instant::now() >= next_check {
             let healthy = check_socks_route(c.verify_port, Duration::from_secs(5)).is_ok();
+            if !healthy {
+                eprintln!("SOCKS route health check failed");
+            }
             next_check = Instant::now() + Duration::from_secs(15);
             if health.observe(healthy) {
                 // SSH keepalives do not prove that forwarded SOCKS requests work.
-                eprintln!("SOCKS route failed three health checks; restarting connector");
+                eprintln!("SOCKS route failed three of five health checks; restarting connector");
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(ServiceError::Command("SOCKS route health"));
@@ -411,14 +411,19 @@ pub fn verify() -> Result<()> {
 mod tests {
     use super::*;
     #[test]
-    fn requires_consecutive_route_failures_before_restarting() {
-        let mut health = RouteHealth::default();
-        assert!(!health.observe(false));
-        assert!(!health.observe(false));
-        assert!(!health.observe(true));
-        assert!(!health.observe(false));
-        assert!(!health.observe(false));
-        assert!(health.observe(false));
+    fn detects_repeated_stalls_without_restarting_for_an_isolated_failure() {
+        let mut isolated = RouteHealth::default();
+        for healthy in [false, true, true, true, true, true, false, true, true] {
+            assert!(!isolated.observe(healthy));
+        }
+        let mut repeated = RouteHealth::default();
+        for healthy in [false, false, true, true] {
+            assert!(!repeated.observe(healthy));
+        }
+        assert!(repeated.observe(false));
+        for _ in 0..5 {
+            assert!(!repeated.observe(true));
+        }
     }
 
     #[test]
