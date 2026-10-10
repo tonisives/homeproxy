@@ -2,12 +2,12 @@ use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::{
     env, fs,
-    net::{TcpListener, TcpStream},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 
@@ -157,6 +157,43 @@ pub fn ssh_args(c: &Config) -> Vec<String> {
         format!("{}@{}", c.user, c.gateway),
     ]
 }
+struct SleepAssertion(Child);
+impl Drop for SleepAssertion {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[derive(Default)]
+struct RouteHealth {
+    failures: u8,
+}
+impl RouteHealth {
+    fn observe(&mut self, healthy: bool) -> bool {
+        self.failures = if healthy {
+            0
+        } else {
+            self.failures.saturating_add(1)
+        };
+        self.failures >= 3
+    }
+}
+
+fn check_socks_route(port: u16, timeout: Duration) -> Result<()> {
+    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    let mut stream = TcpStream::connect_timeout(&address, timeout)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    stream.write_all(&[5, 1, 0])?;
+    let mut reply = [0; 2];
+    stream.read_exact(&mut reply)?;
+    if reply != [5, 0] {
+        return Err(ServiceError::Invalid("SOCKS route greeting rejected"));
+    }
+    Ok(())
+}
+
 pub fn run() -> Result<()> {
     let c = load()?;
     if c.mode != "direct" {
@@ -179,7 +216,15 @@ pub fn run() -> Result<()> {
     for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
         signal_hook::flag::register(signal, stopped.clone())?;
     }
+    // The production route depends on this Mac while the connector is enabled.
+    let _awake = SleepAssertion(
+        Command::new("/usr/bin/caffeinate")
+            .args(["-i", "-w", &std::process::id().to_string()])
+            .spawn()?,
+    );
     let mut child = Command::new("/usr/bin/ssh").args(ssh_args(&c)).spawn()?;
+    let mut health = RouteHealth::default();
+    let mut next_check = Instant::now() + Duration::from_secs(15);
     loop {
         if stopped.load(std::sync::atomic::Ordering::Relaxed) {
             let _ = child.kill();
@@ -192,6 +237,17 @@ pub fn run() -> Result<()> {
             } else {
                 Err(ServiceError::Command("SSH tunnel"))
             };
+        }
+        if Instant::now() >= next_check {
+            let healthy = check_socks_route(c.verify_port, Duration::from_secs(5)).is_ok();
+            next_check = Instant::now() + Duration::from_secs(15);
+            if health.observe(healthy) {
+                // SSH keepalives do not prove that forwarded SOCKS requests work.
+                eprintln!("SOCKS route failed three health checks; restarting connector");
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ServiceError::Command("SOCKS route health"));
+            }
         }
         thread::sleep(Duration::from_millis(200));
     }
@@ -289,14 +345,36 @@ pub fn set_enabled(enabled: bool) -> Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()?;
-    if enabled
-        && !Command::new("/bin/launchctl")
-            .arg("bootstrap")
-            .arg(domain)
-            .arg(plist()?)
+    if enabled {
+        // launchd can finish bootout asynchronously while the old worker exits.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Command::new("/bin/launchctl")
+            .args(["print", &target])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()?
             .success()
-    {
+        {
+            if Instant::now() >= deadline {
+                return Err(ServiceError::Command("launchctl bootout completion"));
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+        let path = plist()?;
+        for attempt in 0..3 {
+            if Command::new("/bin/launchctl")
+                .arg("bootstrap")
+                .arg(&domain)
+                .arg(&path)
+                .status()?
+                .success()
+            {
+                return Ok(());
+            }
+            if attempt < 2 {
+                thread::sleep(Duration::from_secs(1));
+            }
+        }
         return Err(ServiceError::Command("launchctl bootstrap"));
     }
     Ok(())
@@ -332,6 +410,46 @@ pub fn verify() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn requires_consecutive_route_failures_before_restarting() {
+        let mut health = RouteHealth::default();
+        assert!(!health.observe(false));
+        assert!(!health.observe(false));
+        assert!(!health.observe(true));
+        assert!(!health.observe(false));
+        assert!(!health.observe(false));
+        assert!(health.observe(false));
+    }
+
+    #[test]
+    fn checks_the_socks_greeting_and_bounds_a_stalled_route() -> Result<()> {
+        for healthy in [true, false] {
+            let listener = TcpListener::bind(("127.0.0.1", 0))?;
+            let port = listener.local_addr()?.port();
+            let server = thread::spawn(move || -> Result<()> {
+                let (mut stream, _) = listener.accept()?;
+                let mut hello = [0; 3];
+                stream.read_exact(&mut hello)?;
+                assert_eq!(hello, [5, 1, 0]);
+                if healthy {
+                    stream.write_all(&[5])?;
+                    stream.write_all(&[0])?;
+                } else {
+                    thread::sleep(Duration::from_millis(100));
+                }
+                Ok(())
+            });
+            assert_eq!(
+                check_socks_route(port, Duration::from_millis(25)).is_ok(),
+                healthy
+            );
+            server
+                .join()
+                .map_err(|_| ServiceError::Invalid("fixture failed"))??;
+        }
+        Ok(())
+    }
+
     fn config() -> Config {
         Config {
             gateway: "gateway.example.com".into(),
