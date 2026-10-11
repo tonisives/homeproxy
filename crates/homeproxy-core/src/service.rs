@@ -236,7 +236,7 @@ pub fn run() -> Result<()> {
             };
         }
         if Instant::now() >= next_check {
-            let healthy = check_socks_route(c.verify_port, Duration::from_secs(5)).is_ok();
+            let healthy = check_socks_route(c.verify_port, Duration::from_secs(10)).is_ok();
             if !healthy {
                 eprintln!("SOCKS route health check failed");
             }
