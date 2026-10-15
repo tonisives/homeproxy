@@ -1,8 +1,8 @@
 import { invoke } from "@tauri-apps/api/core"
-import { useCallback, useEffect, useRef, useState } from "react"
+import { useCallback, useEffect, useRef, useState, type ChangeEvent } from "react"
 
 type ProxyMode = "direct" | "nordvpn" | "upstream"
-
+type ProxyAction = "power" | "mode" | "verify"
 type ProxyStatus = {
   label: string
   mode: ProxyMode
@@ -14,16 +14,13 @@ type ProxyStatus = {
   bytesOut: number
   controllerPath: string | null
 }
+type VerifyResult = { ok: boolean; message: string }
+type Sample = { pid: number | null; bytes: number; time: number }
 
-type VerifyResult = {
-  ok: boolean
-  message: string
-}
-
-type Sample = {
-  pid: number | null
-  bytes: number
-  time: number
+const ROUTES: Record<ProxyMode, { label: string; description: string }> = {
+  direct: { label: "Home network", description: "Browser workers use this Mac’s home internet connection." },
+  nordvpn: { label: "NordVPN", description: "Proxy traffic uses the configured NordVPN SOCKS endpoint." },
+  upstream: { label: "Upstream proxy", description: "Proxy traffic uses your configured upstream SOCKS endpoint." },
 }
 
 let formatBytes = (bytes: number) => {
@@ -38,19 +35,18 @@ let formatBytes = (bytes: number) => {
   return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${unit}`
 }
 
-let formatRate = (bytesPerSecond: number) => `${formatBytes(bytesPerSecond)}/s`
-
-let normalizeError = (error: unknown) =>
-  error instanceof Error ? error.message : String(error)
+let normalizeError = (error: unknown) => error instanceof Error ? error.message : String(error)
 
 export let App = () => {
   let [status, setStatus] = useState<ProxyStatus | null>(null)
   let [rate, setRate] = useState(0)
-  let [busy, setBusy] = useState(false)
+  let [action, setAction] = useState<ProxyAction | null>(null)
   let [error, setError] = useState("")
-  let [verification, setVerification] = useState("")
+  let [statusError, setStatusError] = useState("")
+  let [verification, setVerification] = useState<VerifyResult | null>(null)
   let previousSample = useRef<Sample | null>(null)
-  let firstRefresh = useRef(true)
+  let actionInProgress = useRef(false)
+  let statusVersion = useRef(0)
 
   let applyStatus = useCallback((next: ProxyStatus) => {
     let now = Date.now()
@@ -64,198 +60,188 @@ export let App = () => {
     }
     previousSample.current = { pid: next.pid, bytes, time: now }
     setStatus(next)
+    setStatusError("")
   }, [])
 
-  let refresh = useCallback(async (showErrors = false) => {
+  let refresh = useCallback(async () => {
+    if (actionInProgress.current) return
+    let version = ++statusVersion.current
     try {
       let next = await invoke<ProxyStatus>("get_proxy_status")
-      applyStatus(next)
-      if (showErrors) setError("")
+      if (version === statusVersion.current) applyStatus(next)
     } catch (refreshError) {
-      if (showErrors) setError(normalizeError(refreshError))
+      if (version !== statusVersion.current) return
+      previousSample.current = null
+      setRate(0)
+      setStatusError(normalizeError(refreshError))
     }
   }, [applyStatus])
 
   useEffect(() => {
     let stopped = false
     let timer: number | undefined
-
     let poll = async () => {
-      await refresh(firstRefresh.current)
-      firstRefresh.current = false
+      await refresh()
       if (!stopped) timer = window.setTimeout(poll, 2500)
     }
-
     void poll()
     return () => {
       stopped = true
+      statusVersion.current += 1
       if (timer) window.clearTimeout(timer)
     }
   }, [refresh])
 
-  let runAction = async (action: () => Promise<ProxyStatus>) => {
-    setBusy(true)
+  let runAction = async (kind: ProxyAction, operation: () => Promise<void>) => {
+    if (actionInProgress.current) return
+    actionInProgress.current = true
+    statusVersion.current += 1
+    setAction(kind)
     setError("")
-    setVerification("")
+    setVerification(null)
     try {
-      applyStatus(await action())
+      await operation()
     } catch (actionError) {
       setError(normalizeError(actionError))
-      await refresh()
     } finally {
-      setBusy(false)
+      actionInProgress.current = false
+      await refresh()
+      setAction(null)
     }
   }
 
   let toggleEnabled = () => {
     if (!status) return
-    void runAction(() => invoke<ProxyStatus>("set_proxy_enabled", { enabled: !status.enabled }))
+    void runAction("power", async () => {
+      applyStatus(await invoke<ProxyStatus>("set_proxy_enabled", { enabled: !status.enabled }))
+    })
   }
 
-  let chooseMode = (mode: ProxyMode) => {
+  let chooseMode = (event: ChangeEvent<HTMLSelectElement>) => {
+    let mode = event.target.value as ProxyMode
     if (!status || status.mode === mode) return
-    void runAction(() => invoke<ProxyStatus>("set_proxy_mode", { mode }))
+    void runAction("mode", async () => {
+      applyStatus(await invoke<ProxyStatus>("set_proxy_mode", { mode }))
+    })
   }
 
-  let verify = async () => {
-    setBusy(true)
-    setError("")
-    setVerification("")
-    try {
-      let result = await invoke<VerifyResult>("verify_proxy")
-      setVerification(result.message)
-      await refresh()
-    } catch (verifyError) {
-      setError(normalizeError(verifyError))
-    } finally {
-      setBusy(false)
-    }
+  let verify = () => {
+    void runAction("verify", async () => {
+      setVerification(await invoke<VerifyResult>("verify_proxy"))
+    })
   }
 
-  let connected = status?.connected ?? false
+  let retry = () => { void refresh() }
+  let connected = Boolean(status?.connected && !statusError)
+  let busy = action !== null
+  let unavailable = Boolean(statusError)
+  let route = status ? ROUTES[status.mode] : null
+  let connectionTitle = unavailable ? "Status unavailable"
+    : !status ? "Checking connection…"
+    : connected ? "Proxy connected"
+    : status.enabled ? "Connecting…" : "Proxy is off"
+  let connectionDescription = unavailable ? "The connection status could not be refreshed. Try again to check this Mac."
+    : !status ? "Checking the proxy service on this Mac."
+    : connected ? "Remote browser workers can use this Mac’s connection."
+    : status.enabled ? "The service is running. Waiting for the complete proxy route to respond."
+    : "Turn on the proxy to share this Mac’s connection with browser workers."
+  let message = error || verification?.message
+  let messageIsError = Boolean(error || (verification && !verification.ok))
   let total = (status?.bytesIn ?? 0) + (status?.bytesOut ?? 0)
+  let powerLabel = action === "power" ? "Updating…" : status?.enabled ? "Turn off" : "Turn on"
 
   return (
-    <main>
-      <header className="titlebar" data-tauri-drag-region>
-        <div className="brand" data-tauri-drag-region>
-          <span className="brand-mark" aria-hidden="true">HP</span>
-          <div data-tauri-drag-region>
-            <h1 data-tauri-drag-region>HomeProxy</h1>
-            <p data-tauri-drag-region>{status?.label ?? "Loading service"}</p>
-          </div>
-        </div>
-        <div className={`connection-pill ${connected ? "connected" : "offline"}`}>
-          <span className="status-dot" />
-          {connected ? "Connected" : status?.enabled ? "Starting" : "Offline"}
-        </div>
+    <main className="app-window">
+      <header className="toolbar" data-tauri-drag-region>
+        <h1 data-tauri-drag-region>HomeProxy</h1>
       </header>
-
-      <section className="hero-panel">
-        <div className="route-visual" aria-hidden="true">
-          <div className="route-node home-node">HOME</div>
-          <div className={`route-line ${connected ? "active" : ""}`}>
-            <span />
-          </div>
-          <div className={`route-node exit-node ${status?.mode === "nordvpn" ? "nord" : "direct"}`}>
-            {status?.mode === "nordvpn" ? "NORD" : "ISP"}
-          </div>
-        </div>
-
-        <div className="hero-copy">
-          <span className="eyebrow">Trends egress route</span>
-          <h2>{status?.mode === "nordvpn" ? "Home tunnel via NordVPN" : "Direct through home network"}</h2>
-          <p>
-            {status?.mode === "nordvpn"
-              ? "Only this proxy is relayed through Nord's authenticated SOCKS endpoint."
-              : "Traffic exits through your home ISP without the Nord relay."}
-          </p>
-        </div>
-
-        <button
-          className={`power-button ${status?.enabled ? "on" : ""}`}
-          type="button"
-          disabled={!status || busy}
-          onClick={toggleEnabled}
-          aria-label={status?.enabled ? "Turn proxy off" : "Turn proxy on"}
-        >
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M12 2v10M6.3 5.8a8 8 0 1 0 11.4 0" />
-          </svg>
-          <span>{status?.enabled ? "Turn off" : "Turn on"}</span>
-        </button>
-      </section>
-
-      <section className="controls-grid">
-        <div className="card route-card">
-          <div className="card-heading">
-            <div>
-              <span className="eyebrow">Proxy route</span>
-              <h3>Exit mode</h3>
+      <div className="content-area">
+        <div className="content-column">
+          <section aria-labelledby="connection-heading">
+            <div className="section-heading">
+              <h2 id="connection-heading">Connection</h2>
+              <span className="secondary">On this Mac</span>
             </div>
-            <span className="mode-badge">{status?.mode === "nordvpn" ? "Sweden" : "Home"}</span>
-          </div>
-          <div className="segmented-control">
-            <button
-              type="button"
-              className={status?.mode === "direct" ? "selected" : ""}
-              disabled={!status || busy}
-              onClick={() => chooseMode("direct")}
-            >
-              <strong>Direct</strong>
-              <span>Home ISP</span>
-            </button>
-            <button
-              type="button"
-              className={status?.mode === "nordvpn" ? "selected" : ""}
-              disabled={!status || busy}
-              onClick={() => chooseMode("nordvpn")}
-            >
-              <strong>NordVPN</strong>
-              <span>Proxy only</span>
-            </button>
-          </div>
-        </div>
-
-        <div className="card traffic-card">
-          <div className="card-heading">
-            <div>
-              <span className="eyebrow">Managed tunnel</span>
-              <h3>Traffic</h3>
+            <div className="group">
+              <div className="connection-row">
+                <div className={`connection-symbol ${connected ? "is-connected" : ""}`} aria-hidden="true">
+                  <svg viewBox="0 0 24 24">
+                    <path d="M12 3 4 6v6c0 4 4 7 8 9 4-2 8-5 8-9V6l-8-3Z" />
+                    <path d="m8 12 3 3 5-6" />
+                  </svg>
+                </div>
+                <div className="connection-copy" role="status">
+                  <h3>{connectionTitle}</h3>
+                  <p>{connectionDescription}</p>
+                </div>
+                <button type="button" className={status?.enabled ? "" : "primary-button"}
+                  disabled={!status || busy || unavailable} onClick={toggleEnabled}>
+                  {powerLabel}
+                </button>
+              </div>
+              <div className="connection-facts">
+                <span>Exit route <strong>{route?.label ?? "—"}</strong></span>
+                <span>Traffic <strong>{!status || unavailable ? "—" : `${formatBytes(rate)}/s`}</strong></span>
+              </div>
+              <div className="check-row">
+                <span>Test the complete proxy route</span>
+                <button type="button" disabled={!status?.enabled || busy || unavailable} onClick={verify}>
+                  {action === "verify" ? "Checking…" : "Check connection"}
+                </button>
+              </div>
             </div>
-            <span className="live-rate">{formatRate(rate)}</span>
-          </div>
-          <div className="traffic-total">{formatBytes(total)}</div>
-          <div className="traffic-split">
-            <span><i className="down" />Received <strong>{formatBytes(status?.bytesIn ?? 0)}</strong></span>
-            <span><i className="up" />Sent <strong>{formatBytes(status?.bytesOut ?? 0)}</strong></span>
-          </div>
+          </section>
+          {unavailable && (
+            <aside className="message error-message" role="alert">
+              <div><strong>Couldn’t read the proxy status</strong><p>{statusError}</p></div>
+              <button type="button" disabled={busy} onClick={retry}>Try again</button>
+            </aside>
+          )}
+          {message && (
+            <aside className={`message ${messageIsError ? "error-message" : "success-message"}`}
+              role={messageIsError ? "alert" : "status"}>{message}</aside>
+          )}
+          <section className="details-section" aria-label="Proxy settings and details">
+            <details className="disclosure">
+              <summary>Route settings <span className="summary-value">{route?.label ?? "—"}</span></summary>
+              <div className="disclosure-content">
+                <div className="setting-row">
+                  <div><label htmlFor="exit-route">Exit route</label><p>{route?.description ?? "Choose where proxy traffic exits."}</p></div>
+                  <select id="exit-route" value={status?.mode ?? "direct"} disabled={!status || busy || unavailable} onChange={chooseMode}>
+                    <option value="direct">Home network</option>
+                    <option value="nordvpn">NordVPN</option>
+                    <option value="upstream">Upstream proxy</option>
+                  </select>
+                </div>
+                <p className="footnote">NordVPN and upstream routes require a configured SOCKS endpoint. Changing the route reconnects the proxy.</p>
+              </div>
+            </details>
+            <details className="disclosure">
+              <summary>Traffic details <span className="summary-value">{!status || unavailable ? "—" : `${formatBytes(total)} total`}</span></summary>
+              <div className="disclosure-content">
+                <dl className="traffic-grid">
+                  <div><dt>Received</dt><dd>{!status || unavailable ? "—" : formatBytes(status.bytesIn)}</dd></div>
+                  <div><dt>Sent</dt><dd>{!status || unavailable ? "—" : formatBytes(status.bytesOut)}</dd></div>
+                  <div><dt>Current rate</dt><dd>{!status || unavailable ? "—" : `${formatBytes(rate)}/s`}</dd></div>
+                </dl>
+                <p className="footnote">Traffic for the current service process. Totals reset when the service restarts.</p>
+              </div>
+            </details>
+            <details className="disclosure">
+              <summary>Service details <span className="summary-value">{unavailable ? "Unavailable" : !status ? "Checking…" : status.enabled ? "Running" : "Stopped"}</span></summary>
+              <dl className="disclosure-content service-details">
+                <div><dt>Service</dt><dd><code>{status?.label ?? "—"}</code></dd></div>
+                <div><dt>Process ID</dt><dd>{status?.pid ?? "—"}</dd></div>
+                <div><dt>Relay process</dt><dd>{unavailable ? "Unknown" : !status ? "—" : status.relayConnected ? "Running" : "Stopped"}</dd></div>
+                <div><dt>Controller</dt><dd><code>{status ? status.controllerPath ?? "Not installed" : "—"}</code></dd></div>
+              </dl>
+            </details>
+          </section>
         </div>
-      </section>
-
-      <section className="service-bar">
-        <div>
-          <span className="service-icon">PID</span>
-          <div>
-            <strong>{status?.pid ?? "—"}</strong>
-            <span>{status?.controllerPath ?? "Controller not found"}</span>
-          </div>
-        </div>
-        <button type="button" className="verify-button" disabled={!connected || busy} onClick={() => void verify()}>
-          {busy ? "Working…" : "Verify route"}
-        </button>
-      </section>
-
-      {(error || verification) && (
-        <aside className={error ? "message error" : "message success"} role="status">
-          {error || verification}
-        </aside>
-      )}
-
-      <footer>
-        <span>CLI</span>
-        <code>homeproxy status</code>
-
+      </div>
+      <footer className="statusbar">
+        <span className={`connection-state ${connected ? "is-connected" : ""}`}><i aria-hidden="true" />{unavailable ? "Status unavailable" : !status ? "Checking connection" : connected ? "Connected" : status.enabled ? "Connecting" : "Off"}</span>
+        <span>{action === "mode" ? "Updating route…" : busy ? "Working…" : "HomeProxy"}</span>
       </footer>
     </main>
   )
